@@ -19,8 +19,8 @@
 #include <immintrin.h>
 #endif
 
-#include <VapourSynth.h>
-#include <VSHelper.h>
+#include <VapourSynth4.h>
+#include <VSHelper4.h>
 
 using namespace std::string_literals;
 
@@ -116,7 +116,7 @@ struct CUDA_Resource {
 };
 
 struct BilateralData {
-    VSNodeRef * node;
+    VSNode * node;
     const VSVideoInfo * vi;
 
     // stored in graphexec
@@ -132,34 +132,26 @@ struct BilateralData {
     std::mutex resources_lock;
 };
 
-static void VS_CC BilateralInit(
-    VSMap *in, VSMap *out, void **instanceData, VSNode *node,
-    VSCore *core, const VSAPI *vsapi) {
-
-    BilateralData * d = static_cast<BilateralData *>(*instanceData);
-    vsapi->setVideoInfo(d->vi, 1, node);
-}
-
-static const VSFrameRef *VS_CC BilateralGetFrame(
-    int n, int activationReason, void **instanceData, void **frameData,
+static const VSFrame *VS_CC BilateralGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
 
-    BilateralData * d = static_cast<BilateralData *>(*instanceData);
+    BilateralData * d = static_cast<BilateralData *>(instanceData);
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        const VSFrameRef * src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSFrame * src = vsapi->getFrameFilter(n, d->node, frameCtx);
 
         const int pl[] = { 0, 1, 2 };
-        const VSFrameRef * fr[] = {
+        const VSFrame * fr[] = {
             d->process[0] ? nullptr : src,
             d->process[1] ? nullptr : src,
             d->process[2] ? nullptr : src
         };
 
-        VSFrameRef * dst = vsapi->newVideoFrame2(
-            d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
+        VSFrame * dst = vsapi->newVideoFrame2(
+            &d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
         d->semaphore.acquire();
         d->resources_lock.lock();
@@ -181,7 +173,7 @@ static const VSFrameRef *VS_CC BilateralGetFrame(
         cudaStream_t stream = resource.stream;
         const auto & graphexecs = resource.graphexecs;
 
-        for (int plane = 0; plane < d->vi->format->numPlanes; plane++) {
+        for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
             if (!d->process[plane]) {
                 continue;
             }
@@ -190,7 +182,7 @@ static const VSFrameRef *VS_CC BilateralGetFrame(
             int height = vsapi->getFrameHeight(src, plane);
 
             int s_pitch = vsapi->getStride(src, plane);
-            int bps = d->vi->format->bitsPerSample;
+            int bps = d->vi->format.bitsPerSample;
             int s_stride = s_pitch / (bps / 8);
             int width_bytes = width * sizeof(float);
             auto srcp = vsapi->getReadPtr(src, plane);
@@ -198,7 +190,7 @@ static const VSFrameRef *VS_CC BilateralGetFrame(
             int d_stride = d_pitch / sizeof(float);
 
             if (bps == 32) {
-                vs_bitblt(h_buffer, d_pitch, srcp, s_pitch, width_bytes, height);
+                vsh::bitblt(h_buffer, d_pitch, srcp, s_pitch, width_bytes, height);
             } else if (bps == 16) {
                 float * h_bufferp = h_buffer;
                 const uint16_t * src16p = reinterpret_cast<const uint16_t *>(srcp);
@@ -266,7 +258,7 @@ static const VSFrameRef *VS_CC BilateralGetFrame(
             auto dstp = vsapi->getWritePtr(dst, plane);
 
             if (bps == 32) {
-                vs_bitblt(dstp, s_pitch, h_buffer, d_pitch, width_bytes, height);
+                vsh::bitblt(dstp, s_pitch, h_buffer, d_pitch, width_bytes, height);
             } else if (bps == 16) {
                 uint16_t * dst16p = reinterpret_cast<uint16_t *>(dstp);
                 const float * h_bufferp = h_buffer;
@@ -367,19 +359,19 @@ static void VS_CC BilateralCreate(
 
     auto d { std::make_unique<BilateralData>() };
 
-    d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
+    d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
 
     auto set_error = [&](const std::string & error_message) {
-        vsapi->setError(out, ("BilateralGPU: " + error_message).c_str());
+        vsapi->mapSetError(out, ("BilateralGPU: " + error_message).c_str());
         vsapi->freeNode(d->node);
     };
 
     if (auto [bps, sample] = std::pair{
-            d->vi->format->bitsPerSample,
-            d->vi->format->sampleType
+            d->vi->format.bitsPerSample,
+            d->vi->format.sampleType
         };
-        !isConstantFormat(d->vi) ||
+        !vsh::isConstantVideoFormat(d->vi) ||
         (sample == stInteger && (bps != 8 && bps != 16)) ||
         (sample == stFloat && bps != 32)
     ) {
@@ -392,14 +384,14 @@ static void VS_CC BilateralCreate(
     std::array<float, 3> sigma_spatial;
     for (int i = 0; i < std::ssize(sigma_spatial); ++i) {
         sigma_spatial[i] = static_cast<float>(
-            vsapi->propGetFloat(in, "sigma_spatial", i, &error));
+            vsapi->mapGetFloat(in, "sigma_spatial", i, &error));
 
         if (error) {
             if (i == 0) {
                 sigma_spatial[i] = 3.0f;
             } else if (i == 1) {
-                auto subH = d->vi->format->subSamplingH;
-                auto subW = d->vi->format->subSamplingW;
+                auto subH = d->vi->format.subSamplingH;
+                auto subW = d->vi->format.subSamplingW;
                 sigma_spatial[i] = static_cast<float>(
                     sigma_spatial[0] / std::sqrt((1 << subH) * (1 << subW)));
             } else {
@@ -422,7 +414,7 @@ static void VS_CC BilateralCreate(
     std::array<float, 3> sigma_color;
     for (int i = 0; i < std::ssize(sigma_color); ++i) {
         sigma_color[i] = static_cast<float>(
-            vsapi->propGetFloat(in, "sigma_color", i, &error));
+            vsapi->mapGetFloat(in, "sigma_color", i, &error));
 
         if (error) {
             if (i == 0) {
@@ -446,7 +438,7 @@ static void VS_CC BilateralCreate(
 
     std::array<int, 3> radius;
     for (int i = 0; i < std::ssize(radius); ++i) {
-        radius[i] = int64ToIntS(vsapi->propGetInt(in, "radius", i, &error));
+        radius[i] = vsh::int64ToIntS(vsapi->mapGetInt(in, "radius", i, &error));
 
         if (error) {
             radius[i] = std::max(1, static_cast<int>(std::roundf(sigma_spatial[i] * 3.f)));
@@ -455,7 +447,7 @@ static void VS_CC BilateralCreate(
         }
     }
 
-    int device_id = int64ToIntS(vsapi->propGetInt(in, "device_id", 0, &error));
+    int device_id = vsh::int64ToIntS(vsapi->mapGetInt(in, "device_id", 0, &error));
     if (error) {
         device_id = 0;
     }
@@ -469,12 +461,12 @@ static void VS_CC BilateralCreate(
     }
     d->device_id = device_id;
 
-    d->num_streams = int64ToIntS(vsapi->propGetInt(in, "num_streams", 0, &error));
+    d->num_streams = vsh::int64ToIntS(vsapi->mapGetInt(in, "num_streams", 0, &error));
     if (error) {
         d->num_streams = 4;
     }
 
-    bool use_shared_memory = !!vsapi->propGetInt(in, "use_shared_memory", 0, &error);
+    bool use_shared_memory = !!vsapi->mapGetInt(in, "use_shared_memory", 0, &error);
     if (error) {
         use_shared_memory = true;
     }
@@ -486,8 +478,8 @@ static void VS_CC BilateralCreate(
 
         int width = d->vi->width;
         int height = d->vi->height;
-        int ssw = d->vi->format->subSamplingW;
-        int ssh = d->vi->format->subSamplingH;
+        int ssw = d->vi->format.subSamplingW;
+        int ssh = d->vi->format.subSamplingH;
 
         int max_width { d->process[0] ? width : width >> ssw };
         int max_height { d->process[0] ? height : height >> ssh };
@@ -513,7 +505,7 @@ static void VS_CC BilateralCreate(
             checkError(cudaStreamCreateWithFlags(&stream.data, cudaStreamNonBlocking));
 
             std::array<Resource<cudaGraphExec_t, cudaGraphExecDestroy>, 3> graphexecs {};
-            for (int plane = 0; plane < d->vi->format->numPlanes; ++plane) {
+            for (int plane = 0; plane < d->vi->format.numPlanes; ++plane) {
                 if (!d->process[plane]) {
                     continue;
                 }
@@ -539,26 +531,29 @@ static void VS_CC BilateralCreate(
         }
     }
 
-    vsapi->createFilter(
-        in, out, "Bilateral",
-        BilateralInit, BilateralGetFrame, BilateralFree,
-        fmParallel, 0, d.release(), core);
+    VSFilterDependency deps[] = {
+        {d->node, rpStrictSpatial}
+    };
+
+    vsapi->createVideoFilter(
+        out, "Bilateral",
+        d->vi, BilateralGetFrame, BilateralFree,
+        fmParallel, deps, 1, d.release(), core);
 }
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(
-    VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
-
-    configFunc(
+VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
+    vspapi->configPlugin(
         "com.wolframrhodium.bilateralgpu", "bilateralgpu", "Bilateral filter using CUDA",
-        VAPOURSYNTH_API_VERSION, 1, plugin);
+        VS_MAKE_VERSION(1, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
 
-    registerFunc("Bilateral",
-        "clip:clip;"
+    vspapi->registerFunction("Bilateral",
+        "clip:vnode;"
         "sigma_spatial:float[]:opt;"
         "sigma_color:float[]:opt;"
         "radius:int[]:opt;"
         "device_id:int:opt;"
         "num_streams:int:opt;"
         "use_shared_memory:int:opt;",
+        "clip:vnode;",
         BilateralCreate, nullptr, plugin);
 }
